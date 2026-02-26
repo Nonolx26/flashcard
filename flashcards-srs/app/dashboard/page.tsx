@@ -51,6 +51,7 @@ const PROGRESS_STORAGE_PREFIX = "flashcards_progress_";
 const UPDATED_AT_STORAGE_PREFIX = "flashcards_sync_updated_at_";
 const GLOBAL_DECK_ID = "26080900-0000-4000-8000-000000000001";
 const DAY_MS = 24 * 60 * 60 * 1000;
+const REMOTE_SYNC_INTERVAL_MS = 12000;
 
 function dayNumber(ts = Date.now()) {
   return Math.floor(ts / DAY_MS);
@@ -184,9 +185,8 @@ function parseUpdatedAt(raw: string | null) {
   return Math.floor(n);
 }
 
-function sessionScore(progress: Record<string, CardProgress>, history: ReviewEvent[]) {
-  const reps = Object.values(progress).reduce((sum, row) => sum + row.reps, 0);
-  return history.length * 10 + reps;
+function hasSessionData(progress: Record<string, CardProgress>, history: ReviewEvent[]) {
+  return Object.keys(progress).length > 0 || history.length > 0;
 }
 
 function parseHistory(raw: string | null): ReviewEvent[] {
@@ -255,6 +255,7 @@ function dailySeries(events: ReviewEvent[], days: number) {
 export default function Dashboard() {
   const [sessionCode, setSessionCode] = useState("");
   const [isAdmin, setIsAdmin] = useState(false);
+  const [lastSyncedAt, setLastSyncedAt] = useState(0);
 
   const [cards, setCards] = useState<ReviewCard[]>([]);
   const [queue, setQueue] = useState<ReviewCard[]>([]);
@@ -268,15 +269,20 @@ export default function Dashboard() {
   const progressKeyRef = useRef("");
   const updatedAtKeyRef = useRef("");
   const sessionCodeRef = useRef("");
+  const syncInFlightRef = useRef(false);
 
-  const persistHistory = useCallback((events: ReviewEvent[]) => {
-    if (!historyKeyRef.current) return;
-    localStorage.setItem(historyKeyRef.current, JSON.stringify(events));
+  const persistSessionSnapshot = useCallback((snapshot: SessionSyncPayload) => {
+    if (!historyKeyRef.current || !progressKeyRef.current || !updatedAtKeyRef.current) return;
+    localStorage.setItem(historyKeyRef.current, JSON.stringify(snapshot.history));
+    localStorage.setItem(progressKeyRef.current, JSON.stringify(snapshot.progress));
+    localStorage.setItem(updatedAtKeyRef.current, String(snapshot.updatedAt));
   }, []);
 
-  const persistProgress = useCallback((nextCards: ReviewCard[]) => {
-    if (!progressKeyRef.current) return;
-    localStorage.setItem(progressKeyRef.current, JSON.stringify(toProgressMap(nextCards)));
+  const readLocalSnapshot = useCallback((): SessionSyncPayload => {
+    const history = parseHistory(localStorage.getItem(historyKeyRef.current));
+    const progress = parseProgress(localStorage.getItem(progressKeyRef.current));
+    const updatedAt = parseUpdatedAt(localStorage.getItem(updatedAtKeyRef.current));
+    return { progress, history, updatedAt };
   }, []);
 
   const loadSharedCards = useCallback(async (progressOverride?: Record<string, CardProgress>) => {
@@ -300,11 +306,30 @@ export default function Dashboard() {
     setCurrent(reviewQueue[0]);
   }, []);
 
+  const applySessionSnapshot = useCallback(
+    async (snapshot: SessionSyncPayload) => {
+      const updatedAt = snapshot.updatedAt || Date.now();
+      const normalized: SessionSyncPayload = {
+        progress: snapshot.progress,
+        history: snapshot.history,
+        updatedAt,
+      };
+
+      persistSessionSnapshot(normalized);
+      setHistory(normalized.history);
+      setLastSyncedAt(updatedAt);
+      setShowA(false);
+      await loadSharedCards(normalized.progress);
+    },
+    [loadSharedCards, persistSessionSnapshot]
+  );
+
   const syncSession = useCallback(async (payload: {
     code: string;
     progress: Record<string, CardProgress>;
     history: ReviewEvent[];
     updatedAt: number;
+    reset?: boolean;
   }) => {
     const res = await fetch("/api/session-progress", {
       method: "POST",
@@ -342,6 +367,28 @@ export default function Dashboard() {
     };
   }, []);
 
+  const refreshFromRemote = useCallback(async (force = false) => {
+    const code = sessionCodeRef.current;
+    if (!code || syncInFlightRef.current) return;
+
+    syncInFlightRef.current = true;
+    try {
+      const remote = await fetchSessionSync(code);
+      if (!hasSessionData(remote.progress, remote.history) && remote.updatedAt <= 0) {
+        return;
+      }
+
+      const local = readLocalSnapshot();
+      if (force || !hasSessionData(local.progress, local.history) || remote.updatedAt > local.updatedAt) {
+        await applySessionSnapshot(remote);
+      }
+    } catch {
+      // Ignore temporary network failures.
+    } finally {
+      syncInFlightRef.current = false;
+    }
+  }, [applySessionSnapshot, fetchSessionSync, readLocalSnapshot]);
+
   const refreshAdminSession = useCallback(async () => {
     try {
       const res = await fetch("/api/admin/session", { method: "GET" });
@@ -377,74 +424,66 @@ export default function Dashboard() {
     queueMicrotask(() => {
       setSessionCode(code);
       void (async () => {
-        if (code === ADMIN_LOGIN_CODE) {
-          await fetch("/api/admin/session", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ code }),
-          }).catch(() => null);
-        }
-
-        let localHistory = parseHistory(localStorage.getItem(historyKeyRef.current));
-        let localProgress = parseProgress(localStorage.getItem(progressKeyRef.current));
-        let localUpdatedAt = parseUpdatedAt(localStorage.getItem(updatedAtKeyRef.current));
-
+        syncInFlightRef.current = true;
         try {
-          const remote = await fetchSessionSync(code);
-          const remoteHasData = Object.keys(remote.progress).length > 0 || remote.history.length > 0;
-          const localHasData = Object.keys(localProgress).length > 0 || localHistory.length > 0;
+          if (code === ADMIN_LOGIN_CODE) {
+            await fetch("/api/admin/session", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ code }),
+            }).catch(() => null);
+          }
 
-          if (remoteHasData || remote.updatedAt > 0) {
-            let useRemote = remote.updatedAt > localUpdatedAt;
+          let localSnapshot = readLocalSnapshot();
+          if (hasSessionData(localSnapshot.progress, localSnapshot.history) && localSnapshot.updatedAt <= 0) {
+            localSnapshot = { ...localSnapshot, updatedAt: Date.now() };
+            persistSessionSnapshot(localSnapshot);
+          }
 
-            if (!useRemote && remote.updatedAt === localUpdatedAt && localHasData) {
-              useRemote = sessionScore(remote.progress, remote.history) > sessionScore(localProgress, localHistory);
-            }
-
-            if (!useRemote && localUpdatedAt === 0 && localHasData) {
-              useRemote = sessionScore(remote.progress, remote.history) > sessionScore(localProgress, localHistory);
-            }
-
-            if (useRemote) {
-              localHistory = remote.history;
-              localProgress = remote.progress;
-              localUpdatedAt = remote.updatedAt || Date.now();
-              localStorage.setItem(historyKeyRef.current, JSON.stringify(localHistory));
-              localStorage.setItem(progressKeyRef.current, JSON.stringify(localProgress));
-              localStorage.setItem(updatedAtKeyRef.current, String(localUpdatedAt));
-            } else if (localHasData) {
-              localUpdatedAt = localUpdatedAt || Date.now();
-              localStorage.setItem(updatedAtKeyRef.current, String(localUpdatedAt));
+          try {
+            if (hasSessionData(localSnapshot.progress, localSnapshot.history)) {
               await syncSession({
                 code,
-                progress: localProgress,
-                history: localHistory,
-                updatedAt: localUpdatedAt,
+                progress: localSnapshot.progress,
+                history: localSnapshot.history,
+                updatedAt: localSnapshot.updatedAt || Date.now(),
               });
             }
-          } else if (localHasData) {
-            localUpdatedAt = localUpdatedAt || Date.now();
-            localStorage.setItem(updatedAtKeyRef.current, String(localUpdatedAt));
-            await syncSession({
-              code,
-              progress: localProgress,
-              history: localHistory,
-              updatedAt: localUpdatedAt,
-            });
-          } else {
-            localUpdatedAt = Date.now();
-            localStorage.setItem(updatedAtKeyRef.current, String(localUpdatedAt));
-          }
-        } catch {
-          // Keep local fallback when server sync is unavailable.
-        }
 
-        setHistory(localHistory);
-        await refreshAdminSession();
-        await loadSharedCards(localProgress);
+            const remote = await fetchSessionSync(code);
+            if (hasSessionData(remote.progress, remote.history) || remote.updatedAt > 0) {
+              localSnapshot = remote;
+            }
+          } catch {
+            // Keep local fallback when server sync is temporarily unavailable.
+          }
+
+          await applySessionSnapshot(localSnapshot);
+          await refreshAdminSession();
+        } finally {
+          syncInFlightRef.current = false;
+        }
       })();
     });
-  }, [fetchSessionSync, loadSharedCards, refreshAdminSession, syncSession]);
+  }, [applySessionSnapshot, fetchSessionSync, persistSessionSnapshot, readLocalSnapshot, refreshAdminSession, syncSession]);
+
+  useEffect(() => {
+    if (!sessionCode) return;
+
+    const onFocus = () => {
+      void refreshFromRemote();
+    };
+
+    window.addEventListener("focus", onFocus);
+    const timer = window.setInterval(() => {
+      void refreshFromRemote();
+    }, REMOTE_SYNC_INTERVAL_MS);
+
+    return () => {
+      window.removeEventListener("focus", onFocus);
+      window.clearInterval(timer);
+    };
+  }, [refreshFromRemote, sessionCode]);
 
   async function parseCsv(file: File) {
     if (!isAdmin) {
@@ -507,9 +546,13 @@ export default function Dashboard() {
     }
 
     const updatedAt = Date.now();
-    localStorage.setItem(progressKeyRef.current, JSON.stringify({}));
-    localStorage.setItem(historyKeyRef.current, JSON.stringify([]));
-    localStorage.setItem(updatedAtKeyRef.current, String(updatedAt));
+    const emptySnapshot: SessionSyncPayload = {
+      progress: {},
+      history: [],
+      updatedAt,
+    };
+    persistSessionSnapshot(emptySnapshot);
+    setLastSyncedAt(updatedAt);
 
     setHistory([]);
     setCards([]);
@@ -518,12 +561,20 @@ export default function Dashboard() {
     setShowA(false);
 
     if (sessionCodeRef.current) {
-      void syncSession({
-        code: sessionCodeRef.current,
-        progress: {},
-        history: [],
-        updatedAt,
-      });
+      void (async () => {
+        try {
+          await syncSession({
+            code: sessionCodeRef.current,
+            progress: emptySnapshot.progress,
+            history: emptySnapshot.history,
+            updatedAt: emptySnapshot.updatedAt,
+            reset: true,
+          });
+          await refreshFromRemote(true);
+        } catch {
+          // Keep local reset if sync is unavailable.
+        }
+      })();
     }
   }
 
@@ -536,21 +587,32 @@ export default function Dashboard() {
     const nextCards = cards.map((card) => (card.id === current.id ? updatedCard : card));
     const nextQueue = queue.filter((card) => card.id !== current.id);
 
-    const nextHistory = [...history, { ts: Date.now(), grade: g, cardId: current.id }].slice(-5000);
     const updatedAt = Date.now();
+    const nextHistory = [...history, { ts: updatedAt, grade: g, cardId: current.id }].slice(-5000);
+    const nextSnapshot: SessionSyncPayload = {
+      progress: toProgressMap(nextCards),
+      history: nextHistory,
+      updatedAt,
+    };
 
     setCards(nextCards);
     setHistory(nextHistory);
-    persistHistory(nextHistory);
-    persistProgress(nextCards);
-    localStorage.setItem(updatedAtKeyRef.current, String(updatedAt));
+    persistSessionSnapshot(nextSnapshot);
+    setLastSyncedAt(updatedAt);
     if (sessionCodeRef.current) {
-      void syncSession({
-        code: sessionCodeRef.current,
-        progress: toProgressMap(nextCards),
-        history: nextHistory,
-        updatedAt,
-      });
+      void (async () => {
+        try {
+          await syncSession({
+            code: sessionCodeRef.current,
+            progress: nextSnapshot.progress,
+            history: nextSnapshot.history,
+            updatedAt: nextSnapshot.updatedAt,
+          });
+          await refreshFromRemote(true);
+        } catch {
+          // Keep local progression if sync is unavailable.
+        }
+      })();
     }
 
     if (nextQueue.length > 0) {
@@ -602,6 +664,10 @@ export default function Dashboard() {
 
   const trend = useMemo(() => dailySeries(history.slice(-100), 14), [history]);
   const trendMax = Math.max(...trend.map((d) => d.count), 1);
+  const syncLabel = useMemo(() => {
+    if (!lastSyncedAt) return "-";
+    return new Date(lastSyncedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  }, [lastSyncedAt]);
 
   return (
     <main className="max-w-5xl mx-auto p-4 md:p-6 space-y-4">
@@ -611,7 +677,7 @@ export default function Dashboard() {
             <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Flashcards SRS</p>
             <h1 className="text-xl md:text-2xl font-bold">Revision + Stats</h1>
             <p className="text-xs text-slate-400 mt-1">
-              Code: {sessionCode || "-"} | Mode: {isAdmin ? "Admin CSV global" : "Session perso"}
+              Code: {sessionCode || "-"} | Mode: {isAdmin ? "Admin CSV global" : "Session perso"} | Sync: {syncLabel}
             </p>
           </div>
           <div className="flex items-center gap-2">

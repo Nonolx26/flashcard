@@ -16,6 +16,7 @@ type SessionPayload = {
   progress?: Record<string, ProgressRow>;
   history?: Array<{ ts?: number; grade?: string; cardId?: string }>;
   updatedAt?: number;
+  reset?: boolean;
 };
 
 function isValidCode(code: string) {
@@ -97,6 +98,116 @@ function sanitizeHistory(value: unknown) {
   return filtered.slice(-5000);
 }
 
+function normalizeUpdatedAt(value: unknown) {
+  const n = Number(value ?? 0);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.floor(n);
+}
+
+function sanitizeStoredPayload(value: unknown) {
+  if (!value || typeof value !== "object") {
+    return { progress: {}, history: [], updatedAt: 0 };
+  }
+
+  const row = value as { progress?: unknown; history?: unknown; updatedAt?: unknown };
+  return {
+    progress: sanitizeProgress(row.progress),
+    history: sanitizeHistory(row.history),
+    updatedAt: normalizeUpdatedAt(row.updatedAt),
+  };
+}
+
+function latestEventByCard(events: Array<{ ts: number; grade: "bad" | "mid" | "good"; cardId: string }>) {
+  const map = new Map<string, number>();
+  for (const event of events) {
+    const prev = map.get(event.cardId) ?? 0;
+    if (event.ts > prev) {
+      map.set(event.cardId, event.ts);
+    }
+  }
+  return map;
+}
+
+function mergeHistory(
+  remote: Array<{ ts: number; grade: "bad" | "mid" | "good"; cardId: string }>,
+  incoming: Array<{ ts: number; grade: "bad" | "mid" | "good"; cardId: string }>
+) {
+  const map = new Map<string, { ts: number; grade: "bad" | "mid" | "good"; cardId: string }>();
+
+  for (const event of [...remote, ...incoming]) {
+    map.set(`${event.ts}|${event.cardId}|${event.grade}`, event);
+  }
+
+  return Array.from(map.values())
+    .sort((a, b) => a.ts - b.ts)
+    .slice(-5000);
+}
+
+function progressRank(row: { reps: number; ease: number; interval: number; due: number; goodStreak: number } | undefined) {
+  if (!row) return -1;
+  return row.reps * 100000 + row.goodStreak * 1000 + row.interval;
+}
+
+function mergeProgress(
+  remote: Record<string, { reps: number; ease: number; interval: number; due: number; goodStreak: number }>,
+  incoming: Record<string, { reps: number; ease: number; interval: number; due: number; goodStreak: number }>,
+  remoteHistory: Array<{ ts: number; grade: "bad" | "mid" | "good"; cardId: string }>,
+  incomingHistory: Array<{ ts: number; grade: "bad" | "mid" | "good"; cardId: string }>,
+  remoteUpdatedAt: number,
+  incomingUpdatedAt: number
+) {
+  const remoteLatest = latestEventByCard(remoteHistory);
+  const incomingLatest = latestEventByCard(incomingHistory);
+  const out: Record<string, { reps: number; ease: number; interval: number; due: number; goodStreak: number }> = {};
+  const ids = new Set<string>([...Object.keys(remote), ...Object.keys(incoming)]);
+
+  for (const id of ids) {
+    const remoteRow = remote[id];
+    const incomingRow = incoming[id];
+    const remoteTs = remoteLatest.get(id) ?? 0;
+    const incomingTs = incomingLatest.get(id) ?? 0;
+
+    if (incomingTs > remoteTs) {
+      if (incomingRow) out[id] = incomingRow;
+      continue;
+    }
+
+    if (remoteTs > incomingTs) {
+      if (remoteRow) out[id] = remoteRow;
+      continue;
+    }
+
+    if (remoteRow && !incomingRow) {
+      out[id] = remoteRow;
+      continue;
+    }
+
+    if (incomingRow && !remoteRow) {
+      out[id] = incomingRow;
+      continue;
+    }
+
+    if (!remoteRow || !incomingRow) continue;
+
+    const remoteScore = progressRank(remoteRow);
+    const incomingScore = progressRank(incomingRow);
+
+    if (incomingScore > remoteScore) {
+      out[id] = incomingRow;
+      continue;
+    }
+
+    if (remoteScore > incomingScore) {
+      out[id] = remoteRow;
+      continue;
+    }
+
+    out[id] = incomingUpdatedAt >= remoteUpdatedAt ? incomingRow : remoteRow;
+  }
+
+  return out;
+}
+
 function pathForCode(code: string) {
   return `${code}.json`;
 }
@@ -129,14 +240,13 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    const parsed = JSON.parse(raw) as { progress?: unknown; history?: unknown; updatedAt?: unknown };
-    const updatedAtRaw = Number(parsed.updatedAt ?? 0);
-    const updatedAt = Number.isFinite(updatedAtRaw) && updatedAtRaw > 0 ? Math.floor(updatedAtRaw) : 0;
+    const parsed = JSON.parse(raw) as unknown;
+    const clean = sanitizeStoredPayload(parsed);
 
     return NextResponse.json({
-      progress: sanitizeProgress(parsed.progress),
-      history: sanitizeHistory(parsed.history),
-      updatedAt,
+      progress: clean.progress,
+      history: clean.history,
+      updatedAt: clean.updatedAt,
     });
   } catch {
     return NextResponse.json({ progress: {}, history: [], updatedAt: 0 });
@@ -161,14 +271,59 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: ensured.error ?? "Bucket error" }, { status: 500 });
   }
 
-  const updatedAtRaw = Number(body.updatedAt ?? 0);
-  const updatedAt = Number.isFinite(updatedAtRaw) && updatedAtRaw > 0 ? Math.floor(updatedAtRaw) : Date.now();
-
-  const payload = {
+  const incomingPayload = {
     progress: sanitizeProgress(body.progress),
     history: sanitizeHistory(body.history),
-    updatedAt,
+    updatedAt: normalizeUpdatedAt(body.updatedAt) || Date.now(),
   };
+
+  let payload = incomingPayload;
+
+  if (!body.reset) {
+    let remotePayload = { progress: {}, history: [], updatedAt: 0 } as {
+      progress: Record<string, { reps: number; ease: number; interval: number; due: number; goodStreak: number }>;
+      history: Array<{ ts: number; grade: "bad" | "mid" | "good"; cardId: string }>;
+      updatedAt: number;
+    };
+
+    const existing = await supabase.storage.from(BUCKET).download(pathForCode(code));
+    if (existing.error) {
+      if (
+        !isMissingStorageError({
+          message: existing.error.message,
+          statusCode: (existing.error as { statusCode?: string | number }).statusCode,
+        })
+      ) {
+        return NextResponse.json({ error: existing.error.message }, { status: 500 });
+      }
+    } else {
+      const raw = await existing.data.text();
+      if (raw) {
+        try {
+          remotePayload = sanitizeStoredPayload(JSON.parse(raw));
+        } catch {
+          remotePayload = { progress: {}, history: [], updatedAt: 0 };
+        }
+      }
+    }
+
+    const mergedHistory = mergeHistory(remotePayload.history, incomingPayload.history);
+    const mergedProgress = mergeProgress(
+      remotePayload.progress,
+      incomingPayload.progress,
+      remotePayload.history,
+      incomingPayload.history,
+      remotePayload.updatedAt,
+      incomingPayload.updatedAt
+    );
+
+    const latestEventTs = mergedHistory.length ? mergedHistory[mergedHistory.length - 1].ts : 0;
+    payload = {
+      progress: mergedProgress,
+      history: mergedHistory,
+      updatedAt: Math.max(remotePayload.updatedAt, incomingPayload.updatedAt, latestEventTs),
+    };
+  }
 
   const up = await supabase.storage
     .from(BUCKET)
