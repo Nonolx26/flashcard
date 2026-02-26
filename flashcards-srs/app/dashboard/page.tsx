@@ -39,6 +39,7 @@ type ReviewStats = {
 
 const AUTH_STORAGE_KEY = "flashcards_pin_ok";
 const SESSION_CODE_STORAGE_KEY = "flashcards_session_code";
+const ADMIN_LOGIN_CODE = "260809";
 const HISTORY_STORAGE_PREFIX = "flashcards_review_history_";
 const PROGRESS_STORAGE_PREFIX = "flashcards_progress_";
 const GLOBAL_DECK_ID = "26080900-0000-4000-8000-000000000001";
@@ -301,6 +302,13 @@ export default function Dashboard() {
       setSessionCode(code);
       setHistory(parseHistory(localStorage.getItem(historyKeyRef.current)));
       void (async () => {
+        if (code === ADMIN_LOGIN_CODE) {
+          await fetch("/api/admin/session", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ code }),
+          }).catch(() => null);
+        }
         await refreshAdminSession();
         await loadSharedCards();
       })();

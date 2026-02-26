@@ -3,6 +3,7 @@ import { FormEvent, useEffect, useState } from "react";
 
 const AUTH_STORAGE_KEY = "flashcards_pin_ok";
 const SESSION_CODE_STORAGE_KEY = "flashcards_session_code";
+const ADMIN_LOGIN_CODE = "260809";
 
 export default function Login() {
   const [code, setCode] = useState("");
@@ -17,16 +18,21 @@ export default function Login() {
   async function handle(e: FormEvent) {
     e.preventDefault();
 
-    if (!code.trim()) {
-      setError("Entre un code");
+    if (code.length !== 6) {
+      setError("Le code doit contenir 6 chiffres");
       return;
     }
 
-    await fetch("/api/admin/session", {
+    const res = await fetch("/api/admin/session", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ code }),
     }).catch(() => null);
+
+    if (code === ADMIN_LOGIN_CODE && (!res || !res.ok)) {
+      setError("Le mode admin est indisponible. Verifie ADMIN_CODE cote serveur.");
+      return;
+    }
 
     localStorage.setItem(SESSION_CODE_STORAGE_KEY, code);
     localStorage.setItem(AUTH_STORAGE_KEY, "1");
@@ -45,6 +51,7 @@ export default function Login() {
           type="password"
           required
           inputMode="numeric"
+          minLength={6}
           maxLength={6}
           placeholder="123456"
           value={code}
