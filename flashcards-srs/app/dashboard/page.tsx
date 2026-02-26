@@ -37,6 +37,16 @@ export default function Dashboard() {
     setCurrent(data?.[0] as Card | undefined);
   }, []);
 
+  const ensureDeckExists = useCallback(async (id: string) => {
+    const { error } = await supabase.from("decks").insert({ id });
+
+    if (!error) return true;
+    if (error.code === "23505") return true; // already exists
+
+    alert(`Erreur deck: ${error.message}`);
+    return false;
+  }, []);
+
   useEffect(() => {
     const isAuthed = localStorage.getItem(AUTH_STORAGE_KEY) === "1";
     if (!isAuthed) {
@@ -50,12 +60,17 @@ export default function Dashboard() {
     deckIdRef.current = localDeckId;
 
     queueMicrotask(() => {
-      void load(localDeckId);
+      void (async () => {
+        const ok = await ensureDeckExists(localDeckId);
+        if (ok) await load(localDeckId);
+      })();
     });
-  }, [load]);
+  }, [ensureDeckExists, load]);
 
   async function parseCsv(file: File) {
     const deckId = deckIdRef.current;
+    const ok = await ensureDeckExists(deckId);
+    if (!ok) return;
 
     Papa.parse(file, {
       complete: async (res) => {
