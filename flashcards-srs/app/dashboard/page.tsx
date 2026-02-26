@@ -41,7 +41,6 @@ const AUTH_STORAGE_KEY = "flashcards_pin_ok";
 const SESSION_CODE_STORAGE_KEY = "flashcards_session_code";
 const HISTORY_STORAGE_PREFIX = "flashcards_review_history_";
 const PROGRESS_STORAGE_PREFIX = "flashcards_progress_";
-const ADMIN_CODE = process.env.NEXT_PUBLIC_ACCESS_CODE ?? "260809";
 const GLOBAL_DECK_ID = "26080900-0000-4000-8000-000000000001";
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -237,14 +236,6 @@ export default function Dashboard() {
   const historyKeyRef = useRef("");
   const progressKeyRef = useRef("");
 
-  const ensureDeckExists = useCallback(async () => {
-    const { error } = await supabase.from("decks").insert({ id: GLOBAL_DECK_ID });
-    if (!error) return true;
-    if (error.code === "23505") return true;
-    alert(`Erreur deck: ${error.message}`);
-    return false;
-  }, []);
-
   const persistHistory = useCallback((events: ReviewEvent[]) => {
     if (!historyKeyRef.current) return;
     localStorage.setItem(historyKeyRef.current, JSON.stringify(events));
@@ -255,34 +246,44 @@ export default function Dashboard() {
     localStorage.setItem(progressKeyRef.current, JSON.stringify(toProgressMap(nextCards)));
   }, []);
 
-  const loadSharedCards = useCallback(
-    async (adminMode: boolean) => {
-      if (adminMode) {
-        const ok = await ensureDeckExists();
-        if (!ok) return;
+  const loadSharedCards = useCallback(async () => {
+    const { data, error } = await supabase
+      .from("cards")
+      .select("id,question,answer")
+      .eq("deck_id", GLOBAL_DECK_ID);
+
+    if (error) {
+      alert(error.message);
+      return;
+    }
+
+    const progressMap = parseProgress(localStorage.getItem(progressKeyRef.current));
+    const baseCards = (data ?? []) as BaseCard[];
+    const merged = mergeCardsWithProgress(baseCards, progressMap);
+    const reviewQueue = buildReviewQueue(merged);
+
+    setCards(merged);
+    setQueue(reviewQueue);
+    setCurrent(reviewQueue[0]);
+  }, []);
+
+  const refreshAdminSession = useCallback(async () => {
+    try {
+      const res = await fetch("/api/admin/session", { method: "GET" });
+      if (!res.ok) {
+        setIsAdmin(false);
+        return false;
       }
 
-      const { data, error } = await supabase
-        .from("cards")
-        .select("id,question,answer")
-        .eq("deck_id", GLOBAL_DECK_ID);
-
-      if (error) {
-        alert(error.message);
-        return;
-      }
-
-      const progressMap = parseProgress(localStorage.getItem(progressKeyRef.current));
-      const baseCards = (data ?? []) as BaseCard[];
-      const merged = mergeCardsWithProgress(baseCards, progressMap);
-      const reviewQueue = buildReviewQueue(merged);
-
-      setCards(merged);
-      setQueue(reviewQueue);
-      setCurrent(reviewQueue[0]);
-    },
-    [ensureDeckExists]
-  );
+      const data = (await res.json()) as { isAdmin?: boolean };
+      const ok = Boolean(data.isAdmin);
+      setIsAdmin(ok);
+      return ok;
+    } catch {
+      setIsAdmin(false);
+      return false;
+    }
+  }, []);
 
   useEffect(() => {
     const isAuthed = localStorage.getItem(AUTH_STORAGE_KEY) === "1";
@@ -298,20 +299,39 @@ export default function Dashboard() {
 
     queueMicrotask(() => {
       setSessionCode(code);
-      setIsAdmin(code === ADMIN_CODE);
       setHistory(parseHistory(localStorage.getItem(historyKeyRef.current)));
-      void loadSharedCards(code === ADMIN_CODE);
+      void (async () => {
+        await refreshAdminSession();
+        await loadSharedCards();
+      })();
     });
-  }, [loadSharedCards]);
+  }, [loadSharedCards, refreshAdminSession]);
+
+  async function requestAdminAccess() {
+    const code = window.prompt("Code admin:");
+    if (!code) return;
+
+    const res = await fetch("/api/admin/session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code }),
+    });
+
+    if (!res.ok) {
+      alert("Code admin invalide");
+      setIsAdmin(false);
+      return;
+    }
+
+    setIsAdmin(true);
+    alert("Mode admin active");
+  }
 
   async function parseCsv(file: File) {
     if (!isAdmin) {
       alert("Seul le code 260809 peut importer un CSV global.");
       return;
     }
-
-    const ok = await ensureDeckExists();
-    if (!ok) return;
 
     Papa.parse(file, {
       skipEmptyLines: true,
@@ -330,16 +350,19 @@ export default function Dashboard() {
           return;
         }
 
-        const { error } = await supabase
-          .from("cards")
-          .insert(payload.map((p) => ({ ...p, deck_id: GLOBAL_DECK_ID })));
+        const resp = await fetch("/api/admin/cards/import", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ payload }),
+        });
 
-        if (error) {
-          alert(error.message);
+        if (!resp.ok) {
+          const data = (await resp.json().catch(() => ({}))) as { error?: string };
+          alert(data.error ?? "Import impossible");
           return;
         }
 
-        await loadSharedCards(true);
+        await loadSharedCards();
         setShowA(false);
       },
       error: (error) => {
@@ -357,9 +380,10 @@ export default function Dashboard() {
     const ok = window.confirm("Supprimer toutes les cartes du CSV global ? Cette action est irreversible.");
     if (!ok) return;
 
-    const { error } = await supabase.from("cards").delete().eq("deck_id", GLOBAL_DECK_ID);
-    if (error) {
-      alert(error.message);
+    const resp = await fetch("/api/admin/cards", { method: "DELETE" });
+    if (!resp.ok) {
+      const data = (await resp.json().catch(() => ({}))) as { error?: string };
+      alert(data.error ?? "Suppression impossible");
       return;
     }
 
@@ -402,6 +426,7 @@ export default function Dashboard() {
   }
 
   function logout() {
+    void fetch("/api/admin/session", { method: "DELETE" });
     localStorage.removeItem(AUTH_STORAGE_KEY);
     localStorage.removeItem(SESSION_CODE_STORAGE_KEY);
     location.href = "/";
@@ -466,7 +491,12 @@ export default function Dashboard() {
                 </button>
               </>
             ) : (
-              <p className="text-xs text-slate-400">CSV global en lecture seule (admin: 260809)</p>
+              <button
+                onClick={requestAdminAccess}
+                className="px-3 py-2 rounded-lg bg-white/10 hover:bg-white/15 text-xs font-semibold"
+              >
+                Activer mode admin
+              </button>
             )}
             <button onClick={logout} className="px-3 py-2 rounded-lg bg-white/10 hover:bg-white/15 text-sm">
               Quitter
@@ -520,7 +550,7 @@ export default function Dashboard() {
                   ) : (
                     <>
                       <p className="text-slate-300">Le CSV global n&apos;est pas encore importe.</p>
-                      <p className="text-sm text-slate-400">Demande a l&apos;admin (code 260809) de charger le deck.</p>
+                      <p className="text-sm text-slate-400">Demande a l&apos;admin de charger le deck.</p>
                     </>
                   )}
                 </div>
