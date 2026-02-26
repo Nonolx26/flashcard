@@ -34,20 +34,22 @@ export async function POST(request: NextRequest) {
   };
 
   const payload = Array.isArray(body.payload) ? body.payload : [];
-  const clean = payload
+  const cleanRows = payload
     .map((item) => ({
       question: String(item.question ?? "").trim(),
       answer: String(item.answer ?? "").trim(),
     }))
-    .filter((item) => item.question && item.answer)
-    .map((item) => ({
-      ...item,
-      deck_id: GLOBAL_DECK_ID,
-      reps: 0,
-      ease: 2,
-      interval: 0,
-      due: 0,
-    }));
+    .filter((item) => item.question && item.answer);
+
+  const clean = cleanRows.map((item, index) => ({
+    ...item,
+    deck_id: GLOBAL_DECK_ID,
+    question_number: index + 1,
+    reps: 0,
+    ease: 2,
+    interval: 0,
+    due: 0,
+  }));
 
   if (!clean.length) {
     return NextResponse.json({ error: "Empty payload" }, { status: 400 });
@@ -56,6 +58,11 @@ export async function POST(request: NextRequest) {
   const deckInsert = await supabase.from("decks").insert({ id: GLOBAL_DECK_ID });
   if (deckInsert.error && deckInsert.error.code !== "23505") {
     return NextResponse.json({ error: deckInsert.error.message }, { status: 500 });
+  }
+
+  const wipe = await supabase.from("cards").delete().eq("deck_id", GLOBAL_DECK_ID);
+  if (wipe.error) {
+    return NextResponse.json({ error: wipe.error.message }, { status: 500 });
   }
 
   const ins = await supabase.from("cards").insert(clean);
