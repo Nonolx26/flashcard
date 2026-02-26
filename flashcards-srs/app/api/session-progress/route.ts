@@ -105,6 +105,17 @@ function parseTs(value: unknown) {
   return Math.floor(n);
 }
 
+function isPermissionDenied(error: { code?: string; message?: string } | null) {
+  if (!error) return false;
+  const code = String(error.code ?? "");
+  const message = String(error.message ?? "").toLowerCase();
+  return code === "42501" || message.includes("permission denied");
+}
+
+function permissionDeniedMessage() {
+  return "Permission SQL manquante sur review_actions. Execute le script sql/2026-02-26-review-actions-permissions-hotfix.sql dans Supabase SQL Editor.";
+}
+
 export async function GET(request: NextRequest) {
   const code = request.nextUrl.searchParams.get("code") ?? "";
 
@@ -130,6 +141,14 @@ export async function GET(request: NextRequest) {
       return NextResponse.json(
         {
           error: "Table review_actions manquante. Execute le SQL de migration avant de relancer l'app.",
+        },
+        { status: 500 }
+      );
+    }
+    if (isPermissionDenied(error)) {
+      return NextResponse.json(
+        {
+          error: permissionDeniedMessage(),
         },
         { status: 500 }
       );
@@ -178,6 +197,9 @@ export async function POST(request: NextRequest) {
   if (body.reset) {
     const del = await supabase.from("review_actions").delete().eq("session_code", code);
     if (del.error) {
+      if (isPermissionDenied(del.error)) {
+        return NextResponse.json({ error: permissionDeniedMessage() }, { status: 500 });
+      }
       return NextResponse.json({ error: del.error.message }, { status: 500 });
     }
     return NextResponse.json({ ok: true, reset: true });
@@ -196,6 +218,9 @@ export async function POST(request: NextRequest) {
 
   const cardLookup = await supabase.from("cards").select("id,question_number").eq("id", cardId).single();
   if (cardLookup.error || !cardLookup.data) {
+    if (cardLookup.error && isPermissionDenied(cardLookup.error)) {
+      return NextResponse.json({ error: "Permission SQL manquante sur cards. Verifie les GRANT service_role." }, { status: 500 });
+    }
     return NextResponse.json({ error: "Card not found" }, { status: 400 });
   }
 
@@ -225,6 +250,14 @@ export async function POST(request: NextRequest) {
       return NextResponse.json(
         {
           error: "Table review_actions manquante. Execute le SQL de migration avant de relancer l'app.",
+        },
+        { status: 500 }
+      );
+    }
+    if (isPermissionDenied(ins.error)) {
+      return NextResponse.json(
+        {
+          error: permissionDeniedMessage(),
         },
         { status: 500 }
       );

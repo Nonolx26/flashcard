@@ -54,15 +54,6 @@ function dayNumber(ts = Date.now()) {
   return Math.floor(ts / DAY_MS);
 }
 
-function shuffleCards<T>(list: T[]) {
-  const next = [...list];
-  for (let i = next.length - 1; i > 0; i -= 1) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [next[i], next[j]] = [next[j], next[i]];
-  }
-  return next;
-}
-
 function defaultProgress(): CardProgress {
   return { reps: 0, ease: 2, interval: 0, due: 0, goodStreak: 0 };
 }
@@ -117,11 +108,13 @@ function mergeCardsWithProgress(baseCards: BaseCard[], progressMap: Record<strin
 
 function buildReviewQueue(allCards: ReviewCard[]) {
   const today = dayNumber();
-  const unseen = allCards.filter((card) => card.reps <= 0);
+  const unseen = allCards
+    .filter((card) => card.reps <= 0)
+    .sort((a, b) => a.id.localeCompare(b.id));
   const dueCards = allCards
     .filter((card) => card.reps > 0 && card.due <= today)
-    .sort((a, b) => a.due - b.due || a.reps - b.reps);
-  return [...shuffleCards(unseen), ...shuffleCards(dueCards)];
+    .sort((a, b) => a.due - b.due || a.reps - b.reps || a.id.localeCompare(b.id));
+  return [...unseen, ...dueCards];
 }
 
 function nextSchedule(card: ReviewCard, grade: Grade, reviewedAt = Date.now()) {
@@ -220,38 +213,66 @@ export default function Dashboard() {
   const fileRef = useRef<HTMLInputElement>(null);
   const sessionCodeRef = useRef("");
   const syncInFlightRef = useRef(false);
+  const currentIdRef = useRef<string | undefined>(undefined);
+  const showARef = useRef(false);
 
-  const loadSharedCards = useCallback(async (progressOverride: Record<string, CardProgress>) => {
-    const { data, error } = await supabase
-      .from("cards")
-      .select("id,question,answer")
-      .eq("deck_id", GLOBAL_DECK_ID)
-      .order("question_number", { ascending: true });
+  useEffect(() => {
+    currentIdRef.current = current?.id;
+  }, [current]);
 
-    if (error) {
-      alert(error.message);
-      return;
-    }
+  useEffect(() => {
+    showARef.current = showA;
+  }, [showA]);
 
-    const baseCards = (data ?? []) as BaseCard[];
-    const merged = mergeCardsWithProgress(baseCards, progressOverride);
-    const reviewQueue = buildReviewQueue(merged);
+  const loadSharedCards = useCallback(
+    async (progressOverride: Record<string, CardProgress>, preserveCurrentId?: string) => {
+      const { data, error } = await supabase
+        .from("cards")
+        .select("id,question,answer")
+        .eq("deck_id", GLOBAL_DECK_ID)
+        .order("question_number", { ascending: true });
 
-    setCards(merged);
-    setQueue(reviewQueue);
-    setCurrent(reviewQueue[0]);
-  }, []);
+      if (error) {
+        alert(error.message);
+        return undefined;
+      }
+
+      const baseCards = (data ?? []) as BaseCard[];
+      const merged = mergeCardsWithProgress(baseCards, progressOverride);
+      const reviewQueue = buildReviewQueue(merged);
+      let orderedQueue = reviewQueue;
+
+      if (preserveCurrentId) {
+        const index = reviewQueue.findIndex((card) => card.id === preserveCurrentId);
+        if (index > 0) {
+          orderedQueue = [reviewQueue[index], ...reviewQueue.slice(index + 1), ...reviewQueue.slice(0, index)];
+        }
+      }
+
+      const nextCurrent = orderedQueue[0];
+
+      setCards(merged);
+      setQueue(orderedQueue);
+      setCurrent(nextCurrent);
+      return nextCurrent?.id;
+    },
+    []
+  );
 
   const applyRemoteSnapshot = useCallback(
     async (snapshot: SessionSyncPayload) => {
       const cleanHistory = sanitizeHistory(snapshot.history);
       const progressMap = progressFromHistory(cleanHistory);
       const lastHistoryTs = cleanHistory.length ? cleanHistory[cleanHistory.length - 1].ts : 0;
+      const previousCurrentId = currentIdRef.current;
+      const previousShowAnswer = showARef.current;
 
       setHistory(cleanHistory);
       setLastSyncedAt(Math.max(snapshot.updatedAt || 0, lastHistoryTs));
-      setShowA(false);
-      await loadSharedCards(progressMap);
+
+      const nextCurrentId = await loadSharedCards(progressMap, previousCurrentId);
+      const keepAnswerVisible = Boolean(previousCurrentId) && nextCurrentId === previousCurrentId;
+      setShowA(keepAnswerVisible ? previousShowAnswer : false);
     },
     [loadSharedCards]
   );
