@@ -2,14 +2,15 @@
 import { FormEvent, useEffect, useState } from "react";
 
 const AUTH_STORAGE_KEY = "flashcards_pin_ok";
-const ACCESS_CODE = process.env.NEXT_PUBLIC_ACCESS_CODE ?? "260809";
+const SESSION_CODE_STORAGE_KEY = "flashcards_session_code";
+const ADMIN_CODE = process.env.NEXT_PUBLIC_ACCESS_CODE ?? "260809";
 
 export default function Login() {
   const [code, setCode] = useState("");
   const [error, setError] = useState("");
 
   useEffect(() => {
-    if (localStorage.getItem(AUTH_STORAGE_KEY) === "1") {
+    if (localStorage.getItem(AUTH_STORAGE_KEY) === "1" && localStorage.getItem(SESSION_CODE_STORAGE_KEY)) {
       location.href = "/dashboard";
     }
   }, []);
@@ -17,11 +18,12 @@ export default function Login() {
   function handle(e: FormEvent) {
     e.preventDefault();
 
-    if (code !== ACCESS_CODE) {
-      setError("Code incorrect");
+    if (!code.trim()) {
+      setError("Entre un code");
       return;
     }
 
+    localStorage.setItem(SESSION_CODE_STORAGE_KEY, code);
     localStorage.setItem(AUTH_STORAGE_KEY, "1");
     location.href = "/dashboard";
   }
@@ -33,13 +35,15 @@ export default function Login() {
         className="w-full max-w-sm space-y-4 p-6 rounded-2xl bg-white/5 backdrop-blur border border-white/10 shadow-xl"
       >
         <h1 className="text-xl font-bold text-center">Flashcards SRS</h1>
-        <p className="text-sm text-slate-300 text-center">Entre ton code a 6 chiffres</p>
+        <p className="text-sm text-slate-300 text-center">
+          Entre ton code perso. Le code admin est {ADMIN_CODE}.
+        </p>
         <input
           type="password"
           required
           inputMode="numeric"
           maxLength={6}
-          placeholder="260809"
+          placeholder="000000"
           value={code}
           onChange={(e) => {
             setError("");

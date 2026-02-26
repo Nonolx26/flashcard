@@ -8,15 +8,21 @@ import clsx from "clsx";
 
 type Grade = "bad" | "mid" | "good";
 
-type Card = {
+type BaseCard = {
   id: string;
   question: string;
   answer: string;
+};
+
+type CardProgress = {
   reps: number;
   ease: number;
   interval: number;
   due: number;
+  goodStreak: number;
 };
+
+type ReviewCard = BaseCard & CardProgress;
 
 type ReviewEvent = {
   ts: number;
@@ -32,15 +38,18 @@ type ReviewStats = {
 };
 
 const AUTH_STORAGE_KEY = "flashcards_pin_ok";
-const DECK_STORAGE_KEY = "flashcards_deck_id";
+const SESSION_CODE_STORAGE_KEY = "flashcards_session_code";
 const HISTORY_STORAGE_PREFIX = "flashcards_review_history_";
-const DEFAULT_DECK_ID = "26080900-0000-4000-8000-000000000001";
+const PROGRESS_STORAGE_PREFIX = "flashcards_progress_";
+const ADMIN_CODE = process.env.NEXT_PUBLIC_ACCESS_CODE ?? "260809";
+const GLOBAL_DECK_ID = "26080900-0000-4000-8000-000000000001";
+const DAY_MS = 24 * 60 * 60 * 1000;
 
-function isUuid(value: string) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+function dayNumber(ts = Date.now()) {
+  return Math.floor(ts / DAY_MS);
 }
 
-function shuffleCards(list: Card[]) {
+function shuffleCards<T>(list: T[]) {
   const next = [...list];
   for (let i = next.length - 1; i > 0; i -= 1) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -49,8 +58,109 @@ function shuffleCards(list: Card[]) {
   return next;
 }
 
-function historyKey(deckId: string) {
-  return `${HISTORY_STORAGE_PREFIX}${deckId}`;
+function defaultProgress(): CardProgress {
+  return { reps: 0, ease: 2, interval: 0, due: 0, goodStreak: 0 };
+}
+
+function parseProgress(raw: string | null): Record<string, CardProgress> {
+  if (!raw) return {};
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+
+    const next: Record<string, CardProgress> = {};
+    for (const [cardId, value] of Object.entries(parsed)) {
+      if (!value || typeof value !== "object") continue;
+      const row = value as Partial<CardProgress>;
+
+      const reps = Number(row.reps ?? 0);
+      const ease = Number(row.ease ?? 2);
+      const interval = Number(row.interval ?? 0);
+      const due = Number(row.due ?? 0);
+      const goodStreak = Number(row.goodStreak ?? 0);
+
+      if (![reps, ease, interval, due, goodStreak].every(Number.isFinite)) continue;
+
+      next[cardId] = {
+        reps: Math.max(0, Math.floor(reps)),
+        ease: Math.max(1.2, Math.min(3, ease)),
+        interval: Math.max(0, Math.floor(interval)),
+        due: Math.max(0, Math.floor(due)),
+        goodStreak: Math.max(0, Math.floor(goodStreak)),
+      };
+    }
+    return next;
+  } catch {
+    return {};
+  }
+}
+
+function toProgressMap(cards: ReviewCard[]) {
+  const map: Record<string, CardProgress> = {};
+  for (const card of cards) {
+    map[card.id] = {
+      reps: card.reps,
+      ease: card.ease,
+      interval: card.interval,
+      due: card.due,
+      goodStreak: card.goodStreak,
+    };
+  }
+  return map;
+}
+
+function mergeCardsWithProgress(baseCards: BaseCard[], progressMap: Record<string, CardProgress>) {
+  return baseCards.map((card) => ({ ...card, ...(progressMap[card.id] ?? defaultProgress()) }));
+}
+
+function buildReviewQueue(allCards: ReviewCard[]) {
+  const today = dayNumber();
+
+  const unseen = allCards.filter((card) => card.reps <= 0);
+  const dueCards = allCards
+    .filter((card) => card.reps > 0 && card.due <= today)
+    .sort((a, b) => a.due - b.due || a.reps - b.reps);
+
+  return [...shuffleCards(unseen), ...shuffleCards(dueCards)];
+}
+
+function nextSchedule(card: ReviewCard, grade: Grade) {
+  const baseInterval = Math.max(1, card.interval || 1);
+  const nextGoodStreak = grade === "good" ? card.goodStreak + 1 : 0;
+
+  const easeFactor = { bad: 0.88, mid: 0.96, good: 1.08 }[grade];
+  const nextEase = Math.max(1.2, Math.min(3.0, card.ease * easeFactor));
+
+  let nextInterval = 1;
+
+  if (grade === "bad") {
+    nextInterval = 1;
+  } else if (grade === "mid") {
+    nextInterval = 1;
+  } else if (nextGoodStreak === 1) {
+    nextInterval = Math.max(2, Math.round(baseInterval * 1.6));
+  } else if (nextGoodStreak === 2) {
+    nextInterval = Math.max(7, Math.round(baseInterval * 2.8));
+  } else {
+    const veryLong = Math.max(30, Math.round(baseInterval * 4.5));
+    nextInterval = Math.min(365, veryLong + (nextGoodStreak - 3) * 30);
+  }
+
+  return {
+    reps: card.reps + 1,
+    ease: nextEase,
+    interval: nextInterval,
+    due: dayNumber() + nextInterval,
+    goodStreak: nextGoodStreak,
+  } satisfies CardProgress;
+}
+
+function historyKey(code: string) {
+  return `${HISTORY_STORAGE_PREFIX}${code}`;
+}
+
+function progressKey(code: string) {
+  return `${PROGRESS_STORAGE_PREFIX}${code}`;
 }
 
 function parseHistory(raw: string | null): ReviewEvent[] {
@@ -113,65 +223,94 @@ function dailySeries(events: ReviewEvent[], days: number) {
 }
 
 export default function Dashboard() {
-  const [cards, setCards] = useState<Card[]>([]);
-  const [current, setCurrent] = useState<Card>();
+  const [sessionCode, setSessionCode] = useState("");
+  const [isAdmin, setIsAdmin] = useState(false);
+
+  const [cards, setCards] = useState<ReviewCard[]>([]);
+  const [queue, setQueue] = useState<ReviewCard[]>([]);
+  const [current, setCurrent] = useState<ReviewCard>();
   const [showA, setShowA] = useState(false);
   const [tab, setTab] = useState<"review" | "stats">("review");
   const [history, setHistory] = useState<ReviewEvent[]>([]);
 
   const fileRef = useRef<HTMLInputElement>(null);
-  const deckIdRef = useRef(DEFAULT_DECK_ID);
-  const historyKeyRef = useRef(historyKey(DEFAULT_DECK_ID));
+  const historyKeyRef = useRef("");
+  const progressKeyRef = useRef("");
 
-  const load = useCallback(async (deckId: string) => {
-    const { data } = await supabase.from("cards").select("*").order("due").eq("deck_id", deckId);
-    const mixed = shuffleCards((data ?? []) as Card[]);
-    setCards(mixed);
-    setCurrent(mixed[0] as Card | undefined);
-  }, []);
-
-  const ensureDeckExists = useCallback(async (deckId: string) => {
-    const { error } = await supabase.from("decks").insert({ id: deckId });
-
+  const ensureDeckExists = useCallback(async () => {
+    const { error } = await supabase.from("decks").insert({ id: GLOBAL_DECK_ID });
     if (!error) return true;
     if (error.code === "23505") return true;
-
     alert(`Erreur deck: ${error.message}`);
     return false;
   }, []);
 
   const persistHistory = useCallback((events: ReviewEvent[]) => {
+    if (!historyKeyRef.current) return;
     localStorage.setItem(historyKeyRef.current, JSON.stringify(events));
   }, []);
 
+  const persistProgress = useCallback((nextCards: ReviewCard[]) => {
+    if (!progressKeyRef.current) return;
+    localStorage.setItem(progressKeyRef.current, JSON.stringify(toProgressMap(nextCards)));
+  }, []);
+
+  const loadSharedCards = useCallback(
+    async (adminMode: boolean) => {
+      if (adminMode) {
+        const ok = await ensureDeckExists();
+        if (!ok) return;
+      }
+
+      const { data, error } = await supabase
+        .from("cards")
+        .select("id,question,answer")
+        .eq("deck_id", GLOBAL_DECK_ID);
+
+      if (error) {
+        alert(error.message);
+        return;
+      }
+
+      const progressMap = parseProgress(localStorage.getItem(progressKeyRef.current));
+      const baseCards = (data ?? []) as BaseCard[];
+      const merged = mergeCardsWithProgress(baseCards, progressMap);
+      const reviewQueue = buildReviewQueue(merged);
+
+      setCards(merged);
+      setQueue(reviewQueue);
+      setCurrent(reviewQueue[0]);
+    },
+    [ensureDeckExists]
+  );
+
   useEffect(() => {
     const isAuthed = localStorage.getItem(AUTH_STORAGE_KEY) === "1";
-    if (!isAuthed) {
+    const code = localStorage.getItem(SESSION_CODE_STORAGE_KEY) ?? "";
+
+    if (!isAuthed || !code) {
       location.href = "/";
       return;
     }
 
-    const storedDeckId = localStorage.getItem(DECK_STORAGE_KEY);
-    const deckId = storedDeckId && isUuid(storedDeckId) ? storedDeckId : DEFAULT_DECK_ID;
-
-    localStorage.setItem(DECK_STORAGE_KEY, deckId);
-    deckIdRef.current = deckId;
-    historyKeyRef.current = historyKey(deckId);
+    historyKeyRef.current = historyKey(code);
+    progressKeyRef.current = progressKey(code);
 
     queueMicrotask(() => {
-      const existingHistory = parseHistory(localStorage.getItem(historyKeyRef.current));
-      setHistory(existingHistory);
-
-      void (async () => {
-        const ok = await ensureDeckExists(deckId);
-        if (ok) await load(deckId);
-      })();
+      setSessionCode(code);
+      setIsAdmin(code === ADMIN_CODE);
+      setHistory(parseHistory(localStorage.getItem(historyKeyRef.current)));
+      void loadSharedCards(code === ADMIN_CODE);
     });
-  }, [ensureDeckExists, load]);
+  }, [loadSharedCards]);
 
   async function parseCsv(file: File) {
-    const deckId = deckIdRef.current;
-    const ok = await ensureDeckExists(deckId);
+    if (!isAdmin) {
+      alert("Seul le code 260809 peut importer un CSV global.");
+      return;
+    }
+
+    const ok = await ensureDeckExists();
     if (!ok) return;
 
     Papa.parse(file, {
@@ -182,8 +321,8 @@ export default function Dashboard() {
           .map((r) => [String(r[0] ?? "").trim(), String(r[1] ?? "").trim()])
           .filter(([q, a]) => q && a)
           .flatMap(([q, a]) => [
-            { question: q, answer: a },
-            { question: a, answer: q },
+            { question: q, answer: a, reps: 0, ease: 2, interval: 0, due: 0 },
+            { question: a, answer: q, reps: 0, ease: 2, interval: 0, due: 0 },
           ]);
 
         if (!payload.length) {
@@ -193,14 +332,14 @@ export default function Dashboard() {
 
         const { error } = await supabase
           .from("cards")
-          .insert(payload.map((p) => ({ ...p, deck_id: deckId })));
+          .insert(payload.map((p) => ({ ...p, deck_id: GLOBAL_DECK_ID })));
 
         if (error) {
           alert(error.message);
           return;
         }
 
-        await load(deckId);
+        await loadSharedCards(true);
         setShowA(false);
       },
       error: (error) => {
@@ -210,56 +349,61 @@ export default function Dashboard() {
   }
 
   async function clearCurrentCsv() {
-    const deckId = deckIdRef.current;
-    const ok = window.confirm("Supprimer toutes les cartes du CSV en cours ? Cette action est irreversible.");
+    if (!isAdmin) {
+      alert("Seul le code 260809 peut supprimer le CSV global.");
+      return;
+    }
+
+    const ok = window.confirm("Supprimer toutes les cartes du CSV global ? Cette action est irreversible.");
     if (!ok) return;
 
-    const { error } = await supabase.from("cards").delete().eq("deck_id", deckId);
+    const { error } = await supabase.from("cards").delete().eq("deck_id", GLOBAL_DECK_ID);
     if (error) {
       alert(error.message);
       return;
     }
 
+    localStorage.removeItem(progressKeyRef.current);
     localStorage.removeItem(historyKeyRef.current);
+
     setHistory([]);
-    await load(deckId);
+    setCards([]);
+    setQueue([]);
+    setCurrent(undefined);
     setShowA(false);
   }
 
-  async function grade(g: Grade) {
+  function grade(g: Grade) {
     if (!current) return;
-    const deckId = deckIdRef.current;
 
-    const p = { bad: [0.5, 3], mid: [0.9, 6], good: [1.2, 12] }[g];
-    const nextEase = Math.max(1.2, Math.min(2.6, current.ease * p[0]));
-    const nextInt = Math.max(p[1], Math.round((current.interval || 1) * nextEase));
-    const due = (current.due || 0) + nextInt;
+    const schedule = nextSchedule(current, g);
+    const updatedCard: ReviewCard = { ...current, ...schedule };
 
-    const { error } = await supabase
-      .from("cards")
-      .update({
-        reps: current.reps + 1,
-        ease: nextEase,
-        interval: nextInt,
-        due,
-      })
-      .eq("id", current.id);
-
-    if (error) {
-      alert(error.message);
-      return;
-    }
+    const nextCards = cards.map((card) => (card.id === current.id ? updatedCard : card));
+    const nextQueue = queue.filter((card) => card.id !== current.id);
 
     const nextHistory = [...history, { ts: Date.now(), grade: g, cardId: current.id }].slice(-5000);
+
+    setCards(nextCards);
     setHistory(nextHistory);
     persistHistory(nextHistory);
+    persistProgress(nextCards);
 
-    await load(deckId);
+    if (nextQueue.length > 0) {
+      setQueue(nextQueue);
+      setCurrent(nextQueue[0]);
+    } else {
+      const rebuilt = buildReviewQueue(nextCards);
+      setQueue(rebuilt);
+      setCurrent(rebuilt[0]);
+    }
+
     setShowA(false);
   }
 
   function logout() {
     localStorage.removeItem(AUTH_STORAGE_KEY);
+    localStorage.removeItem(SESSION_CODE_STORAGE_KEY);
     location.href = "/";
   }
 
@@ -272,18 +416,23 @@ export default function Dashboard() {
     );
   }
 
+  const today = dayNumber();
+  const unseenCount = useMemo(() => cards.filter((card) => card.reps <= 0).length, [cards]);
+  const dueCount = useMemo(() => cards.filter((card) => card.reps > 0 && card.due <= today).length, [cards, today]);
+  const masteredCount = useMemo(() => cards.filter((card) => card.goodStreak >= 3).length, [cards]);
+
   const globalStats = useMemo(() => reviewStats(history), [history]);
   const last30Stats = useMemo(() => reviewStats(history.slice(-30)), [history]);
   const last100Stats = useMemo(() => reviewStats(history.slice(-100)), [history]);
 
-  const totalReps = useMemo(() => cards.reduce((sum, card) => sum + (card.reps || 0), 0), [cards]);
+  const totalReps = useMemo(() => cards.reduce((sum, card) => sum + card.reps, 0), [cards]);
   const avgEase = useMemo(() => {
     if (!cards.length) return 0;
-    return cards.reduce((sum, card) => sum + (card.ease || 0), 0) / cards.length;
+    return cards.reduce((sum, card) => sum + card.ease, 0) / cards.length;
   }, [cards]);
   const avgInterval = useMemo(() => {
     if (!cards.length) return 0;
-    return cards.reduce((sum, card) => sum + (card.interval || 0), 0) / cards.length;
+    return cards.reduce((sum, card) => sum + card.interval, 0) / cards.length;
   }, [cards]);
 
   const trend = useMemo(() => dailySeries(history.slice(-100), 14), [history]);
@@ -296,20 +445,29 @@ export default function Dashboard() {
           <div>
             <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Flashcards SRS</p>
             <h1 className="text-xl md:text-2xl font-bold">Revision + Stats</h1>
+            <p className="text-xs text-slate-400 mt-1">
+              Code: {sessionCode || "-"} | Mode: {isAdmin ? "Admin CSV global" : "Session perso"}
+            </p>
           </div>
           <div className="flex items-center gap-2">
-            <button
-              onClick={() => fileRef.current?.click()}
-              className="px-3 py-2 rounded-lg bg-sky-500 hover:bg-sky-600 text-sm font-semibold"
-            >
-              Import CSV
-            </button>
-            <button
-              onClick={clearCurrentCsv}
-              className="px-3 py-2 rounded-lg bg-rose-500/20 text-rose-200 hover:bg-rose-500/30 text-sm font-semibold"
-            >
-              Supprimer CSV
-            </button>
+            {isAdmin ? (
+              <>
+                <button
+                  onClick={() => fileRef.current?.click()}
+                  className="px-3 py-2 rounded-lg bg-sky-500 hover:bg-sky-600 text-sm font-semibold"
+                >
+                  Import CSV
+                </button>
+                <button
+                  onClick={clearCurrentCsv}
+                  className="px-3 py-2 rounded-lg bg-rose-500/20 text-rose-200 hover:bg-rose-500/30 text-sm font-semibold"
+                >
+                  Supprimer CSV
+                </button>
+              </>
+            ) : (
+              <p className="text-xs text-slate-400">CSV global en lecture seule (admin: 260809)</p>
+            )}
             <button onClick={logout} className="px-3 py-2 rounded-lg bg-white/10 hover:bg-white/15 text-sm">
               Quitter
             </button>
@@ -344,13 +502,27 @@ export default function Dashboard() {
             {!current ? (
               <div className="h-full min-h-[280px] grid place-items-center text-center">
                 <div className="space-y-3">
-                  <p className="text-slate-300">Aucune carte pour le moment.</p>
-                  <button
-                    onClick={() => fileRef.current?.click()}
-                    className="px-6 py-3 rounded-xl bg-sky-500 hover:bg-sky-600 font-semibold text-white shadow-lg"
-                  >
-                    Importer un CSV
-                  </button>
+                  {cards.length > 0 ? (
+                    <>
+                      <p className="text-slate-300">Aucune carte due pour le moment.</p>
+                      <p className="text-sm text-slate-400">Tu peux revenir plus tard, les cartes acquises sont repoussees.</p>
+                    </>
+                  ) : isAdmin ? (
+                    <>
+                      <p className="text-slate-300">Aucune carte globale pour le moment.</p>
+                      <button
+                        onClick={() => fileRef.current?.click()}
+                        className="px-6 py-3 rounded-xl bg-sky-500 hover:bg-sky-600 font-semibold text-white shadow-lg"
+                      >
+                        Importer un CSV global
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <p className="text-slate-300">Le CSV global n&apos;est pas encore importe.</p>
+                      <p className="text-sm text-slate-400">Demande a l&apos;admin (code 260809) de charger le deck.</p>
+                    </>
+                  )}
                 </div>
               </div>
             ) : (
@@ -396,14 +568,17 @@ export default function Dashboard() {
           </div>
 
           <aside className="rounded-2xl border border-white/10 bg-white/5 p-4 space-y-3">
-            <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Deck</p>
+            <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Session</p>
             <div className="grid grid-cols-2 gap-2">
               <StatChip label="Cartes" value={String(cards.length)} />
-              <StatChip label="Revisions" value={String(globalStats.count)} />
+              <StatChip label="A revoir" value={String(dueCount)} />
+              <StatChip label="Nouvelles" value={String(unseenCount)} />
+              <StatChip label="Acquises 3x" value={String(masteredCount)} />
+              <StatChip label="Dans la queue" value={String(queue.length)} />
               <StatChip label="Reps total" value={String(totalReps)} />
               <StatChip label="Ease moy." value={avgEase.toFixed(2)} />
             </div>
-            <p className="text-xs text-slate-400">Les cartes sont melangees a chaque chargement.</p>
+            <p className="text-xs text-slate-400">Progression sauvegardee par ton code perso.</p>
           </aside>
         </section>
       ) : (
