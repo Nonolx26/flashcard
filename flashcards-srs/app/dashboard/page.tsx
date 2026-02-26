@@ -40,6 +40,7 @@ type ReviewStats = {
 type SessionSyncPayload = {
   progress: Record<string, CardProgress>;
   history: ReviewEvent[];
+  updatedAt: number;
 };
 
 const AUTH_STORAGE_KEY = "flashcards_pin_ok";
@@ -47,6 +48,7 @@ const SESSION_CODE_STORAGE_KEY = "flashcards_session_code";
 const ADMIN_LOGIN_CODE = "260809";
 const HISTORY_STORAGE_PREFIX = "flashcards_review_history_";
 const PROGRESS_STORAGE_PREFIX = "flashcards_progress_";
+const UPDATED_AT_STORAGE_PREFIX = "flashcards_sync_updated_at_";
 const GLOBAL_DECK_ID = "26080900-0000-4000-8000-000000000001";
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -172,6 +174,21 @@ function progressKey(code: string) {
   return `${PROGRESS_STORAGE_PREFIX}${code}`;
 }
 
+function updatedAtKey(code: string) {
+  return `${UPDATED_AT_STORAGE_PREFIX}${code}`;
+}
+
+function parseUpdatedAt(raw: string | null) {
+  const n = Number(raw ?? 0);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.floor(n);
+}
+
+function sessionScore(progress: Record<string, CardProgress>, history: ReviewEvent[]) {
+  const reps = Object.values(progress).reduce((sum, row) => sum + row.reps, 0);
+  return history.length * 10 + reps;
+}
+
 function parseHistory(raw: string | null): ReviewEvent[] {
   if (!raw) return [];
   try {
@@ -249,6 +266,7 @@ export default function Dashboard() {
   const fileRef = useRef<HTMLInputElement>(null);
   const historyKeyRef = useRef("");
   const progressKeyRef = useRef("");
+  const updatedAtKeyRef = useRef("");
   const sessionCodeRef = useRef("");
 
   const persistHistory = useCallback((events: ReviewEvent[]) => {
@@ -282,7 +300,12 @@ export default function Dashboard() {
     setCurrent(reviewQueue[0]);
   }, []);
 
-  const syncSession = useCallback(async (payload: { code: string; progress: Record<string, CardProgress>; history: ReviewEvent[] }) => {
+  const syncSession = useCallback(async (payload: {
+    code: string;
+    progress: Record<string, CardProgress>;
+    history: ReviewEvent[];
+    updatedAt: number;
+  }) => {
     const res = await fetch("/api/session-progress", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -307,11 +330,15 @@ export default function Dashboard() {
     const data = (await res.json()) as {
       progress?: unknown;
       history?: unknown;
+      updatedAt?: unknown;
     };
+
+    const updatedAt = Number(data.updatedAt ?? 0);
 
     return {
       progress: sanitizeProgress(data.progress),
       history: sanitizeHistory(data.history),
+      updatedAt: Number.isFinite(updatedAt) && updatedAt > 0 ? Math.floor(updatedAt) : 0,
     };
   }, []);
 
@@ -344,6 +371,7 @@ export default function Dashboard() {
 
     historyKeyRef.current = historyKey(code);
     progressKeyRef.current = progressKey(code);
+    updatedAtKeyRef.current = updatedAtKey(code);
     sessionCodeRef.current = code;
 
     queueMicrotask(() => {
@@ -359,18 +387,53 @@ export default function Dashboard() {
 
         let localHistory = parseHistory(localStorage.getItem(historyKeyRef.current));
         let localProgress = parseProgress(localStorage.getItem(progressKeyRef.current));
+        let localUpdatedAt = parseUpdatedAt(localStorage.getItem(updatedAtKeyRef.current));
 
         try {
           const remote = await fetchSessionSync(code);
           const remoteHasData = Object.keys(remote.progress).length > 0 || remote.history.length > 0;
+          const localHasData = Object.keys(localProgress).length > 0 || localHistory.length > 0;
 
-          if (remoteHasData) {
-            localHistory = remote.history;
-            localProgress = remote.progress;
-            localStorage.setItem(historyKeyRef.current, JSON.stringify(localHistory));
-            localStorage.setItem(progressKeyRef.current, JSON.stringify(localProgress));
-          } else if (Object.keys(localProgress).length > 0 || localHistory.length > 0) {
-            await syncSession({ code, progress: localProgress, history: localHistory });
+          if (remoteHasData || remote.updatedAt > 0) {
+            let useRemote = remote.updatedAt > localUpdatedAt;
+
+            if (!useRemote && remote.updatedAt === localUpdatedAt && localHasData) {
+              useRemote = sessionScore(remote.progress, remote.history) > sessionScore(localProgress, localHistory);
+            }
+
+            if (!useRemote && localUpdatedAt === 0 && localHasData) {
+              useRemote = sessionScore(remote.progress, remote.history) > sessionScore(localProgress, localHistory);
+            }
+
+            if (useRemote) {
+              localHistory = remote.history;
+              localProgress = remote.progress;
+              localUpdatedAt = remote.updatedAt || Date.now();
+              localStorage.setItem(historyKeyRef.current, JSON.stringify(localHistory));
+              localStorage.setItem(progressKeyRef.current, JSON.stringify(localProgress));
+              localStorage.setItem(updatedAtKeyRef.current, String(localUpdatedAt));
+            } else if (localHasData) {
+              localUpdatedAt = localUpdatedAt || Date.now();
+              localStorage.setItem(updatedAtKeyRef.current, String(localUpdatedAt));
+              await syncSession({
+                code,
+                progress: localProgress,
+                history: localHistory,
+                updatedAt: localUpdatedAt,
+              });
+            }
+          } else if (localHasData) {
+            localUpdatedAt = localUpdatedAt || Date.now();
+            localStorage.setItem(updatedAtKeyRef.current, String(localUpdatedAt));
+            await syncSession({
+              code,
+              progress: localProgress,
+              history: localHistory,
+              updatedAt: localUpdatedAt,
+            });
+          } else {
+            localUpdatedAt = Date.now();
+            localStorage.setItem(updatedAtKeyRef.current, String(localUpdatedAt));
           }
         } catch {
           // Keep local fallback when server sync is unavailable.
@@ -443,8 +506,10 @@ export default function Dashboard() {
       return;
     }
 
-    localStorage.removeItem(progressKeyRef.current);
-    localStorage.removeItem(historyKeyRef.current);
+    const updatedAt = Date.now();
+    localStorage.setItem(progressKeyRef.current, JSON.stringify({}));
+    localStorage.setItem(historyKeyRef.current, JSON.stringify([]));
+    localStorage.setItem(updatedAtKeyRef.current, String(updatedAt));
 
     setHistory([]);
     setCards([]);
@@ -453,7 +518,12 @@ export default function Dashboard() {
     setShowA(false);
 
     if (sessionCodeRef.current) {
-      void syncSession({ code: sessionCodeRef.current, progress: {}, history: [] });
+      void syncSession({
+        code: sessionCodeRef.current,
+        progress: {},
+        history: [],
+        updatedAt,
+      });
     }
   }
 
@@ -467,16 +537,19 @@ export default function Dashboard() {
     const nextQueue = queue.filter((card) => card.id !== current.id);
 
     const nextHistory = [...history, { ts: Date.now(), grade: g, cardId: current.id }].slice(-5000);
+    const updatedAt = Date.now();
 
     setCards(nextCards);
     setHistory(nextHistory);
     persistHistory(nextHistory);
     persistProgress(nextCards);
+    localStorage.setItem(updatedAtKeyRef.current, String(updatedAt));
     if (sessionCodeRef.current) {
       void syncSession({
         code: sessionCodeRef.current,
         progress: toProgressMap(nextCards),
         history: nextHistory,
+        updatedAt,
       });
     }
 

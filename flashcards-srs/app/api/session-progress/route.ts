@@ -15,6 +15,7 @@ type SessionPayload = {
   code?: string;
   progress?: Record<string, ProgressRow>;
   history?: Array<{ ts?: number; grade?: string; cardId?: string }>;
+  updatedAt?: number;
 };
 
 function isValidCode(code: string) {
@@ -116,7 +117,7 @@ export async function GET(request: NextRequest) {
 
   if (error) {
     if (isMissingStorageError({ message: error.message, statusCode: (error as { statusCode?: string | number }).statusCode })) {
-      return NextResponse.json({ progress: {}, history: [] });
+      return NextResponse.json({ progress: {}, history: [], updatedAt: 0 });
     }
 
     return NextResponse.json({ error: error.message }, { status: 500 });
@@ -124,17 +125,21 @@ export async function GET(request: NextRequest) {
 
   const raw = await data.text();
   if (!raw) {
-    return NextResponse.json({ progress: {}, history: [] });
+    return NextResponse.json({ progress: {}, history: [], updatedAt: 0 });
   }
 
   try {
-    const parsed = JSON.parse(raw) as { progress?: unknown; history?: unknown };
+    const parsed = JSON.parse(raw) as { progress?: unknown; history?: unknown; updatedAt?: unknown };
+    const updatedAtRaw = Number(parsed.updatedAt ?? 0);
+    const updatedAt = Number.isFinite(updatedAtRaw) && updatedAtRaw > 0 ? Math.floor(updatedAtRaw) : 0;
+
     return NextResponse.json({
       progress: sanitizeProgress(parsed.progress),
       history: sanitizeHistory(parsed.history),
+      updatedAt,
     });
   } catch {
-    return NextResponse.json({ progress: {}, history: [] });
+    return NextResponse.json({ progress: {}, history: [], updatedAt: 0 });
   }
 }
 
@@ -156,10 +161,13 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: ensured.error ?? "Bucket error" }, { status: 500 });
   }
 
+  const updatedAtRaw = Number(body.updatedAt ?? 0);
+  const updatedAt = Number.isFinite(updatedAtRaw) && updatedAtRaw > 0 ? Math.floor(updatedAtRaw) : Date.now();
+
   const payload = {
     progress: sanitizeProgress(body.progress),
     history: sanitizeHistory(body.history),
-    updatedAt: Date.now(),
+    updatedAt,
   };
 
   const up = await supabase.storage
