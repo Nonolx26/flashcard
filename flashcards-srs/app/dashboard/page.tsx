@@ -307,26 +307,6 @@ export default function Dashboard() {
     });
   }, [loadSharedCards, refreshAdminSession]);
 
-  async function requestAdminAccess() {
-    const code = window.prompt("Code admin:");
-    if (!code) return;
-
-    const res = await fetch("/api/admin/session", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code }),
-    });
-
-    if (!res.ok) {
-      alert("Code admin invalide");
-      setIsAdmin(false);
-      return;
-    }
-
-    setIsAdmin(true);
-    alert("Mode admin active");
-  }
-
   async function parseCsv(file: File) {
     if (!isAdmin) {
       alert("Seul le code 260809 peut importer un CSV global.");
@@ -475,7 +455,7 @@ export default function Dashboard() {
             </p>
           </div>
           <div className="flex items-center gap-2">
-            {isAdmin ? (
+            {isAdmin && (
               <>
                 <button
                   onClick={() => fileRef.current?.click()}
@@ -490,13 +470,6 @@ export default function Dashboard() {
                   Supprimer CSV
                 </button>
               </>
-            ) : (
-              <button
-                onClick={requestAdminAccess}
-                className="px-3 py-2 rounded-lg bg-white/10 hover:bg-white/15 text-xs font-semibold"
-              >
-                Activer mode admin
-              </button>
             )}
             <button onClick={logout} className="px-3 py-2 rounded-lg bg-white/10 hover:bg-white/15 text-sm">
               Quitter
@@ -550,7 +523,7 @@ export default function Dashboard() {
                   ) : (
                     <>
                       <p className="text-slate-300">Le CSV global n&apos;est pas encore importe.</p>
-                      <p className="text-sm text-slate-400">Demande a l&apos;admin de charger le deck.</p>
+                      <p className="text-sm text-slate-400">Le deck sera visible des qu&apos;il sera importe.</p>
                     </>
                   )}
                 </div>

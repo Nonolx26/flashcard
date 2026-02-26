@@ -14,13 +14,19 @@ export default function Login() {
     }
   }, []);
 
-  function handle(e: FormEvent) {
+  async function handle(e: FormEvent) {
     e.preventDefault();
 
     if (!code.trim()) {
       setError("Entre un code");
       return;
     }
+
+    await fetch("/api/admin/session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code }),
+    }).catch(() => null);
 
     localStorage.setItem(SESSION_CODE_STORAGE_KEY, code);
     localStorage.setItem(AUTH_STORAGE_KEY, "1");
@@ -40,7 +46,7 @@ export default function Login() {
           required
           inputMode="numeric"
           maxLength={6}
-          placeholder="000000"
+          placeholder="260809"
           value={code}
           onChange={(e) => {
             setError("");
