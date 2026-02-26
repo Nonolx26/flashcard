@@ -46,7 +46,7 @@ export default function Login() {
           required
           inputMode="numeric"
           maxLength={6}
-          placeholder="260809"
+          placeholder="123456"
           value={code}
           onChange={(e) => {
             setError("");
