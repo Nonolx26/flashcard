@@ -18,7 +18,11 @@ type Card = {
 
 const AUTH_STORAGE_KEY = "flashcards_pin_ok";
 const DECK_STORAGE_KEY = "flashcards_deck_id";
-const DEFAULT_DECK_ID = "solo-deck";
+const DEFAULT_DECK_ID = "26080900-0000-4000-8000-000000000001";
+
+function isUuid(value: string) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
 
 export default function Dashboard() {
   const [cards, setCards] = useState<Card[]>([]);
@@ -40,7 +44,8 @@ export default function Dashboard() {
       return;
     }
 
-    const localDeckId = localStorage.getItem(DECK_STORAGE_KEY) ?? DEFAULT_DECK_ID;
+    const storedDeckId = localStorage.getItem(DECK_STORAGE_KEY);
+    const localDeckId = storedDeckId && isUuid(storedDeckId) ? storedDeckId : DEFAULT_DECK_ID;
     localStorage.setItem(DECK_STORAGE_KEY, localDeckId);
     deckIdRef.current = localDeckId;
 
