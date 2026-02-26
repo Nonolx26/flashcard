@@ -37,6 +37,11 @@ type ReviewStats = {
   good: number;
 };
 
+type SessionSyncPayload = {
+  progress: Record<string, CardProgress>;
+  history: ReviewEvent[];
+};
+
 const AUTH_STORAGE_KEY = "flashcards_pin_ok";
 const SESSION_CODE_STORAGE_KEY = "flashcards_session_code";
 const ADMIN_LOGIN_CODE = "260809";
@@ -62,34 +67,38 @@ function defaultProgress(): CardProgress {
   return { reps: 0, ease: 2, interval: 0, due: 0, goodStreak: 0 };
 }
 
+function sanitizeProgress(value: unknown): Record<string, CardProgress> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+
+  const next: Record<string, CardProgress> = {};
+  for (const [cardId, rowValue] of Object.entries(value)) {
+    if (!rowValue || typeof rowValue !== "object") continue;
+    const row = rowValue as Partial<CardProgress>;
+
+    const reps = Number(row.reps ?? 0);
+    const ease = Number(row.ease ?? 2);
+    const interval = Number(row.interval ?? 0);
+    const due = Number(row.due ?? 0);
+    const goodStreak = Number(row.goodStreak ?? 0);
+
+    if (![reps, ease, interval, due, goodStreak].every(Number.isFinite)) continue;
+
+    next[cardId] = {
+      reps: Math.max(0, Math.floor(reps)),
+      ease: Math.max(1.2, Math.min(3, ease)),
+      interval: Math.max(0, Math.floor(interval)),
+      due: Math.max(0, Math.floor(due)),
+      goodStreak: Math.max(0, Math.floor(goodStreak)),
+    };
+  }
+  return next;
+}
+
 function parseProgress(raw: string | null): Record<string, CardProgress> {
   if (!raw) return {};
   try {
     const parsed: unknown = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-
-    const next: Record<string, CardProgress> = {};
-    for (const [cardId, value] of Object.entries(parsed)) {
-      if (!value || typeof value !== "object") continue;
-      const row = value as Partial<CardProgress>;
-
-      const reps = Number(row.reps ?? 0);
-      const ease = Number(row.ease ?? 2);
-      const interval = Number(row.interval ?? 0);
-      const due = Number(row.due ?? 0);
-      const goodStreak = Number(row.goodStreak ?? 0);
-
-      if (![reps, ease, interval, due, goodStreak].every(Number.isFinite)) continue;
-
-      next[cardId] = {
-        reps: Math.max(0, Math.floor(reps)),
-        ease: Math.max(1.2, Math.min(3, ease)),
-        interval: Math.max(0, Math.floor(interval)),
-        due: Math.max(0, Math.floor(due)),
-        goodStreak: Math.max(0, Math.floor(goodStreak)),
-      };
-    }
-    return next;
+    return sanitizeProgress(parsed);
   } catch {
     return {};
   }
@@ -167,20 +176,24 @@ function parseHistory(raw: string | null): ReviewEvent[] {
   if (!raw) return [];
   try {
     const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-
-    return parsed.filter((item): item is ReviewEvent => {
-      if (!item || typeof item !== "object") return false;
-      const event = item as Partial<ReviewEvent>;
-      return (
-        typeof event.ts === "number" &&
-        typeof event.cardId === "string" &&
-        (event.grade === "bad" || event.grade === "mid" || event.grade === "good")
-      );
-    });
+    return sanitizeHistory(parsed);
   } catch {
     return [];
   }
+}
+
+function sanitizeHistory(value: unknown): ReviewEvent[] {
+  if (!Array.isArray(value)) return [];
+
+  return value.filter((item): item is ReviewEvent => {
+    if (!item || typeof item !== "object") return false;
+    const event = item as Partial<ReviewEvent>;
+    return (
+      typeof event.ts === "number" &&
+      typeof event.cardId === "string" &&
+      (event.grade === "bad" || event.grade === "mid" || event.grade === "good")
+    );
+  });
 }
 
 function reviewStats(events: ReviewEvent[]): ReviewStats {
@@ -236,6 +249,7 @@ export default function Dashboard() {
   const fileRef = useRef<HTMLInputElement>(null);
   const historyKeyRef = useRef("");
   const progressKeyRef = useRef("");
+  const sessionCodeRef = useRef("");
 
   const persistHistory = useCallback((events: ReviewEvent[]) => {
     if (!historyKeyRef.current) return;
@@ -247,7 +261,7 @@ export default function Dashboard() {
     localStorage.setItem(progressKeyRef.current, JSON.stringify(toProgressMap(nextCards)));
   }, []);
 
-  const loadSharedCards = useCallback(async () => {
+  const loadSharedCards = useCallback(async (progressOverride?: Record<string, CardProgress>) => {
     const { data, error } = await supabase
       .from("cards")
       .select("id,question,answer")
@@ -258,7 +272,7 @@ export default function Dashboard() {
       return;
     }
 
-    const progressMap = parseProgress(localStorage.getItem(progressKeyRef.current));
+    const progressMap = progressOverride ?? parseProgress(localStorage.getItem(progressKeyRef.current));
     const baseCards = (data ?? []) as BaseCard[];
     const merged = mergeCardsWithProgress(baseCards, progressMap);
     const reviewQueue = buildReviewQueue(merged);
@@ -266,6 +280,39 @@ export default function Dashboard() {
     setCards(merged);
     setQueue(reviewQueue);
     setCurrent(reviewQueue[0]);
+  }, []);
+
+  const syncSession = useCallback(async (payload: { code: string; progress: Record<string, CardProgress>; history: ReviewEvent[] }) => {
+    const res = await fetch("/api/session-progress", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    if (!res.ok) {
+      throw new Error("session sync failed");
+    }
+  }, []);
+
+  const fetchSessionSync = useCallback(async (code: string): Promise<SessionSyncPayload> => {
+    const res = await fetch(`/api/session-progress?code=${encodeURIComponent(code)}`, {
+      method: "GET",
+      cache: "no-store",
+    });
+
+    if (!res.ok) {
+      throw new Error("session fetch failed");
+    }
+
+    const data = (await res.json()) as {
+      progress?: unknown;
+      history?: unknown;
+    };
+
+    return {
+      progress: sanitizeProgress(data.progress),
+      history: sanitizeHistory(data.history),
+    };
   }, []);
 
   const refreshAdminSession = useCallback(async () => {
@@ -297,10 +344,10 @@ export default function Dashboard() {
 
     historyKeyRef.current = historyKey(code);
     progressKeyRef.current = progressKey(code);
+    sessionCodeRef.current = code;
 
     queueMicrotask(() => {
       setSessionCode(code);
-      setHistory(parseHistory(localStorage.getItem(historyKeyRef.current)));
       void (async () => {
         if (code === ADMIN_LOGIN_CODE) {
           await fetch("/api/admin/session", {
@@ -309,11 +356,32 @@ export default function Dashboard() {
             body: JSON.stringify({ code }),
           }).catch(() => null);
         }
+
+        let localHistory = parseHistory(localStorage.getItem(historyKeyRef.current));
+        let localProgress = parseProgress(localStorage.getItem(progressKeyRef.current));
+
+        try {
+          const remote = await fetchSessionSync(code);
+          const remoteHasData = Object.keys(remote.progress).length > 0 || remote.history.length > 0;
+
+          if (remoteHasData) {
+            localHistory = remote.history;
+            localProgress = remote.progress;
+            localStorage.setItem(historyKeyRef.current, JSON.stringify(localHistory));
+            localStorage.setItem(progressKeyRef.current, JSON.stringify(localProgress));
+          } else if (Object.keys(localProgress).length > 0 || localHistory.length > 0) {
+            await syncSession({ code, progress: localProgress, history: localHistory });
+          }
+        } catch {
+          // Keep local fallback when server sync is unavailable.
+        }
+
+        setHistory(localHistory);
         await refreshAdminSession();
-        await loadSharedCards();
+        await loadSharedCards(localProgress);
       })();
     });
-  }, [loadSharedCards, refreshAdminSession]);
+  }, [fetchSessionSync, loadSharedCards, refreshAdminSession, syncSession]);
 
   async function parseCsv(file: File) {
     if (!isAdmin) {
@@ -383,6 +451,10 @@ export default function Dashboard() {
     setQueue([]);
     setCurrent(undefined);
     setShowA(false);
+
+    if (sessionCodeRef.current) {
+      void syncSession({ code: sessionCodeRef.current, progress: {}, history: [] });
+    }
   }
 
   function grade(g: Grade) {
@@ -400,6 +472,13 @@ export default function Dashboard() {
     setHistory(nextHistory);
     persistHistory(nextHistory);
     persistProgress(nextCards);
+    if (sessionCodeRef.current) {
+      void syncSession({
+        code: sessionCodeRef.current,
+        progress: toProgressMap(nextCards),
+        history: nextHistory,
+      });
+    }
 
     if (nextQueue.length > 0) {
       setQueue(nextQueue);
