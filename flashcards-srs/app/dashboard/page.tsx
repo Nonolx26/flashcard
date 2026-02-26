@@ -106,15 +106,75 @@ function mergeCardsWithProgress(baseCards: BaseCard[], progressMap: Record<strin
   return baseCards.map((card) => ({ ...card, ...(progressMap[card.id] ?? defaultProgress()) }));
 }
 
-function buildReviewQueue(allCards: ReviewCard[]) {
+function buildReviewQueue(
+  allCards: ReviewCard[],
+  events: ReviewEvent[],
+  options?: { preserveCurrentId?: string; avoidCurrentId?: string }
+) {
+  if (!allCards.length) return [];
+
   const today = dayNumber();
-  const unseen = allCards
-    .filter((card) => card.reps <= 0)
-    .sort((a, b) => a.id.localeCompare(b.id));
-  const dueCards = allCards
-    .filter((card) => card.reps > 0 && card.due <= today)
-    .sort((a, b) => a.due - b.due || a.reps - b.reps || a.id.localeCompare(b.id));
-  return [...unseen, ...dueCards];
+  const lastGradeByCard = new Map<string, Grade>();
+  const stepsSinceSeen = new Map<string, number>();
+  const recentLimit = Math.min(events.length, 500);
+
+  for (let i = events.length - 1, step = 0; i >= events.length - recentLimit; i -= 1, step += 1) {
+    const event = events[i];
+    if (!lastGradeByCard.has(event.cardId)) {
+      lastGradeByCard.set(event.cardId, event.grade);
+    }
+    if (!stepsSinceSeen.has(event.cardId)) {
+      stepsSinceSeen.set(event.cardId, step);
+    }
+  }
+
+  const scored = allCards.map((card) => {
+    let score = 10;
+
+    if (card.reps <= 0) score += 24;
+    if (card.due <= today) score += 14 + Math.min(10, today - card.due);
+
+    score += Math.max(0, 5 - card.goodStreak) * 2;
+    score += Math.max(0, 3 - card.interval);
+
+    const lastGrade = lastGradeByCard.get(card.id);
+    if (lastGrade === "bad") score += 18;
+    if (lastGrade === "mid") score += 8;
+    if (lastGrade === "good") score -= 4;
+
+    const steps = stepsSinceSeen.get(card.id);
+    if (steps === undefined) {
+      score += 8;
+    } else if (steps <= 1) {
+      score -= 12;
+    } else if (steps <= 3) {
+      score -= 6;
+    } else if (steps <= 7) {
+      score -= 2;
+    }
+
+    return { card, score };
+  });
+
+  scored.sort((a, b) => b.score - a.score || a.card.id.localeCompare(b.card.id));
+  const queue = scored.map((row) => row.card);
+
+  if (options?.avoidCurrentId && queue.length > 1 && queue[0].id === options.avoidCurrentId) {
+    const first = queue.shift();
+    if (first) {
+      queue.splice(Math.min(2, queue.length), 0, first);
+    }
+  }
+
+  if (options?.preserveCurrentId) {
+    const index = queue.findIndex((card) => card.id === options.preserveCurrentId);
+    if (index > 0) {
+      const [picked] = queue.splice(index, 1);
+      queue.unshift(picked);
+    }
+  }
+
+  return queue;
 }
 
 function nextSchedule(card: ReviewCard, grade: Grade, reviewedAt = Date.now()) {
@@ -225,7 +285,11 @@ export default function Dashboard() {
   }, [showA]);
 
   const loadSharedCards = useCallback(
-    async (progressOverride: Record<string, CardProgress>, preserveCurrentId?: string) => {
+    async (
+      progressOverride: Record<string, CardProgress>,
+      historyOverride: ReviewEvent[],
+      options?: { preserveCurrentId?: string; avoidCurrentId?: string }
+    ) => {
       const { data, error } = await supabase
         .from("cards")
         .select("id,question,answer")
@@ -239,16 +303,7 @@ export default function Dashboard() {
 
       const baseCards = (data ?? []) as BaseCard[];
       const merged = mergeCardsWithProgress(baseCards, progressOverride);
-      const reviewQueue = buildReviewQueue(merged);
-      let orderedQueue = reviewQueue;
-
-      if (preserveCurrentId) {
-        const index = reviewQueue.findIndex((card) => card.id === preserveCurrentId);
-        if (index > 0) {
-          orderedQueue = [reviewQueue[index], ...reviewQueue.slice(index + 1), ...reviewQueue.slice(0, index)];
-        }
-      }
-
+      const orderedQueue = buildReviewQueue(merged, historyOverride, options);
       const nextCurrent = orderedQueue[0];
 
       setCards(merged);
@@ -270,7 +325,7 @@ export default function Dashboard() {
       setHistory(cleanHistory);
       setLastSyncedAt(Math.max(snapshot.updatedAt || 0, lastHistoryTs));
 
-      const nextCurrentId = await loadSharedCards(progressMap, previousCurrentId);
+      const nextCurrentId = await loadSharedCards(progressMap, cleanHistory, { preserveCurrentId: previousCurrentId });
       const keepAnswerVisible = Boolean(previousCurrentId) && nextCurrentId === previousCurrentId;
       setShowA(keepAnswerVisible ? previousShowAnswer : false);
     },
@@ -390,7 +445,7 @@ export default function Dashboard() {
         } catch {
           setHistory([]);
           setLastSyncedAt(0);
-          await loadSharedCards({});
+          await loadSharedCards({}, []);
         }
       })();
     });
@@ -490,21 +545,14 @@ export default function Dashboard() {
     const updatedCard: ReviewCard = { ...current, ...schedule };
 
     const nextCards = cards.map((card) => (card.id === current.id ? updatedCard : card));
-    const nextQueue = queue.filter((card) => card.id !== current.id);
     const nextHistory = [...history, { ts: reviewedAt, grade: g, cardId: current.id }].slice(-5000);
+    const nextQueue = buildReviewQueue(nextCards, nextHistory, { avoidCurrentId: current.id });
 
     setCards(nextCards);
     setHistory(nextHistory);
     setLastSyncedAt(reviewedAt);
-
-    if (nextQueue.length > 0) {
-      setQueue(nextQueue);
-      setCurrent(nextQueue[0]);
-    } else {
-      const rebuilt = buildReviewQueue(nextCards);
-      setQueue(rebuilt);
-      setCurrent(rebuilt[0]);
-    }
+    setQueue(nextQueue);
+    setCurrent(nextQueue[0]);
 
     setShowA(false);
 
