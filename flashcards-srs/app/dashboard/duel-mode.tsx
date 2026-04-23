@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   BoltIcon,
   ClipboardDocumentIcon,
@@ -74,6 +75,7 @@ async function readErrorMessage(response: Response) {
 }
 
 export function DuelModeButton({ deckCount }: { deckCount: number }) {
+  const [mounted, setMounted] = useState(false);
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [busyAction, setBusyAction] = useState<"" | "create" | "join" | "answer">("");
@@ -143,6 +145,21 @@ export function DuelModeButton({ deckCount }: { deckCount: number }) {
     },
     [applySnapshot, forgetCode]
   );
+
+  useEffect(() => {
+    setMounted(true);
+  }, []);
+
+  useEffect(() => {
+    if (!mounted || !open) return;
+
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+
+    return () => {
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [mounted, open]);
 
   useEffect(() => {
     const storedPlayerId = localStorage.getItem(DUEL_PLAYER_STORAGE_KEY);
@@ -335,22 +352,31 @@ export function DuelModeButton({ deckCount }: { deckCount: number }) {
         </span>
       </button>
 
-      <AnimatePresence>
-        {open && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm p-4 md:p-6"
-          >
-            <div className="min-h-full flex items-center justify-center">
+      {mounted &&
+        createPortal(
+          <AnimatePresence>
+            {open && (
               <motion.div
-                initial={{ opacity: 0, y: 24, scale: 0.98 }}
-                animate={{ opacity: 1, y: 0, scale: 1 }}
-                exit={{ opacity: 0, y: 24, scale: 0.98 }}
-                transition={{ duration: 0.2 }}
-                className="w-full max-w-3xl rounded-[28px] overflow-hidden border border-cyan-300/15 bg-[radial-gradient(circle_at_top,_rgba(34,211,238,0.18),_transparent_42%),linear-gradient(180deg,rgba(15,23,42,0.96),rgba(2,6,23,0.96))] shadow-2xl"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                className="fixed inset-0 z-[1000]"
               >
+                <button
+                  type="button"
+                  aria-label="Fermer le duel"
+                  onClick={() => setOpen(false)}
+                  className="absolute inset-0 bg-slate-950/82 backdrop-blur-md"
+                />
+                <div className="relative z-[1001] h-full overflow-y-auto p-4 md:p-6">
+                  <div className="min-h-full flex items-center justify-center">
+                    <motion.div
+                      initial={{ opacity: 0, y: 24, scale: 0.98 }}
+                      animate={{ opacity: 1, y: 0, scale: 1 }}
+                      exit={{ opacity: 0, y: 24, scale: 0.98 }}
+                      transition={{ duration: 0.2 }}
+                      className="relative w-full max-w-3xl rounded-[28px] overflow-hidden border border-cyan-300/15 bg-[radial-gradient(circle_at_top,_rgba(34,211,238,0.18),_transparent_42%),linear-gradient(180deg,rgba(15,23,42,0.98),rgba(2,6,23,0.98))] shadow-[0_24px_90px_rgba(2,6,23,0.7)]"
+                    >
                 <div className="flex items-start justify-between gap-3 px-5 py-4 border-b border-white/10">
                   <div>
                     <p className="text-[11px] uppercase tracking-[0.26em] text-cyan-200/70">Mode duel</p>
@@ -633,11 +659,14 @@ export function DuelModeButton({ deckCount }: { deckCount: number }) {
                     </div>
                   )}
                 </div>
+                    </motion.div>
+                  </div>
+                </div>
               </motion.div>
-            </div>
-          </motion.div>
+            )}
+          </AnimatePresence>,
+          document.body
         )}
-      </AnimatePresence>
     </>
   );
 }
