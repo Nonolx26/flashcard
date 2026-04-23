@@ -5,6 +5,7 @@ import { supabase } from "@/lib/supabaseClient";
 import { ArrowPathIcon, CheckIcon, XMarkIcon } from "@heroicons/react/24/outline";
 import { motion, AnimatePresence } from "framer-motion";
 import clsx from "clsx";
+import { DuelModeButton } from "./duel-mode";
 
 type Grade = "bad" | "mid" | "good";
 
@@ -644,6 +645,7 @@ export default function Dashboard() {
                 </button>
               </>
             )}
+            <DuelModeButton deckCount={cards.length} />
             <button onClick={logout} className="px-3 py-2 rounded-lg bg-white/10 hover:bg-white/15 text-sm">
               Quitter
             </button>
